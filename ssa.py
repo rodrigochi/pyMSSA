@@ -1,14 +1,250 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Feb 21 17:24:49 2019
+Class implementeation of singular spectrum analysis (SSA) inspired by
 
-Class implementeation taken form 
+    https://www.kaggle.com/jdarcy/introducing-ssa-for-time-series-decomposition
 
-https://www.kaggle.com/jdarcy/introducing-ssa-for-time-series-decomposition
-
+Authors: Sebastian Glane and Rodrigo Chi
 """
 import numpy as np
 import pandas as pd
+
+def cartesian_product(*arrays):
+    la = len(arrays)
+    dtype = np.result_type(*arrays)
+    arr = np.empty([len(a) for a in arrays] + [la], dtype=dtype)
+    for i, a in enumerate(np.ix_(*arrays)):
+        arr[...,i] = a
+    return arr.reshape(-1, la)
+
+def block_hankel(shape, blocks):
+    """
+    Computes a Hankel block matrix X, such that
+    
+        +----------+------------+----------+------------+
+        | block[0] | block[1]   |    ...   | block[n]   |
+        +----------+------------+----------+------------+
+        | block[1] | block[2]   |    ...   | block[n+1] |
+        +----------+------------+----------+------------+
+        | block[2] | block[3]   |    ...   | block[n+2] |
+        +----------+------------+----------+------------+
+        |    ...   |    ...     |    ...   |    ...     |
+        +----------+------------+----------+------------+
+        | block[m] | block[m+1] |    ...   | block[m+n] |
+        +----------+------------+----------+------------+
+        
+    It is assumed that all the blocks are Hankel matrices, such that the result
+    is also a Hankel matrix.
+    
+    Parameters
+    ----------
+    shape : list, tuple
+        Specifies the shape of Hankel block matrix.
+
+    blocks : list, tuple
+        List containing blocks to be distributed along the antidiagonals.
+        block[0] occupies the 0th antidiagonal, block[1] the 1st antidiagonal,
+        etc.
+
+    Returns
+    ----------
+    H : numpy.ndarray
+        Block Hankel matrix.
+    """
+    assert isinstance(shape, (tuple, list))
+    assert len(shape) == 2
+    m, n = shape
+    assert m > 0 and n > 0
+    
+    assert isinstance(blocks, (tuple, list))
+    assert all(isinstance(b, np.ndarray) for b in blocks)
+    assert len(blocks) == m + n - 1
+    
+    block_array =  [[None for j in range(n)] for i in range(m)]
+
+    # there will be m + n - 1 diagonals
+    for d in range(m + n): 
+        # get column index of the first element in this diagonal
+        # the index is 0 for the first m lines and d - m for the remaining lines.
+        start_col = max(0, d + 1 - m)
+  
+        # get count of elements in this diagonal
+        count = min(d + 1, (n - start_col), m) 
+  
+        # set elements of this antidiagonal
+        for j in range(count):
+            block_array[min(m, d + 1) - j - 1][start_col + j] = blocks[d]
+
+    return np.block(block_array)
+
+def elementary_embedding(x, l):
+    """
+    Computes elementary embedding of a vector ``X`` with window length ``l``.
+    The result is a Hankel matrix.
+    
+    Parameters
+    ----------
+    x : numpy.ndarray
+        Vector to embed.
+    l : int
+        Window length.
+    
+    Returns
+    ----------
+    X : numpy.ndarray
+        Embedding of x, a Hankel matrix.
+    """
+    assert isinstance(x, np.ndarray)
+    assert isinstance(l, int)
+    assert x.ndim == 1
+    n = x.size
+    assert l > 0 and l <= n / 2
+    k = n - l + 1
+    from scipy.linalg import hankel
+    return hankel(x, np.zeros(l))[:k,:].T
+
+def vectorize(X):
+    """
+    Vectorization of 2D-array X in column-major order.
+    
+    Parameters
+    ----------
+    X : numpy.ndarray
+        2D-array X.
+    
+    Returns
+    ----------
+    x : numpy.ndarray
+        Vectorization of X.
+    """
+    assert isinstance(X, np.ndarray)
+    assert X.ndim == 2
+    return X.flatten(order="F")
+
+def devectorize(x, m):
+    """
+    Devectorization of vector x to a m-by-n array X in column-major order.
+    
+    Parameters
+    ----------
+    x : numpy.ndarray
+        Vector x.
+
+    m : int
+        Integer specifying number of rows.
+    
+    Returns
+    ----------
+    X : numpy.ndarray
+        Devectorization of X.
+    """
+    assert isinstance(x, np.ndarray)
+    assert x.ndim == 1
+    assert isinstance(m, int)
+    assert x.size % m == 0
+    return x.reshape((m, x.size / m), order="F")
+
+def projection_matrix(Nx, Ny, L=None, index_set=None):
+    """
+    Computes a projection matrix for the given index set.
+    """
+    assert isinstance(Nx, int) and Nx > 0
+    assert isinstance(Ny, int) and Ny > 0
+    m = Nx * Ny
+    n = -1
+    
+    # index set mode, required for shaped SSA
+    if index_set is not None:
+        assert isinstance(index_set, set)
+        assert all(isinstance(index, (tuple, list)) \
+                        and len(index) == 2 for index in index_set)
+        
+        # size of domain space
+        n = len(index_set)
+        
+        # lexicographical order of index_set
+        indices = np.array(list(index_set))
+        if indices.shape[0] != 2:
+            assert indices.shape[1] == 2
+            indices = indices.T
+        indices = indices[:,np.lexsort(indices)]
+        
+        # array of row and column indices
+        row_indices = np.empty((n, ), dtype=np.int)
+        col_indices = np.arange(n, dtype=np.int)
+        
+        # ravel row the index
+        for i, index in enumerate(indices.T):
+            assert index[0] < Nx
+            assert index[1] < Ny
+            row_indices[i] = np.ravel_multi_index(index, (Nx, Ny), order="F")
+
+    # windows size mode for rectangular data sets    
+    elif L is not None:
+        assert isinstance(L, (tuple, list)) and len(L) == 2
+        Lx, Ly = L
+        assert isinstance(Lx, int) and isinstance(Ly, int)
+        
+        # size of domain space
+        n = Lx * Ly
+        
+        # array of row and column indices
+        row_indices = np.empty((n, ), dtype=np.int)
+        col_indices = np.arange(n, dtype=np.int)
+
+        # ravel row the index for pairwise indices
+        import itertools
+        for i, index in enumerate(itertools.product(xrange(Lx), xrange(Ly))):
+            row_indices[i] = np.ravel_multi_index(index, (Nx, Ny), order="F")
+    else:
+        raise ValueError()
+        
+    assert n > 0
+
+    # initialize array of zeros
+    P = np.zeros((m, n))
+    
+    # set all indices at once
+    P[row_indices, col_indices] = 1.0
+    return P
+
+def diagsums(U, V, N, L):
+    """
+    Diagonal summation algorithm.
+    """
+    assert isinstance(U, np.ndarray)
+    assert isinstance(V, np.ndarray)
+    assert U.ndim == 1
+    assert V.ndim == 1
+    l = U.size
+    k = V.size
+    
+    assert isinstance(N, (tuple, list)) and len(N) == 2
+    Nx, Ny = N
+    assert isinstance(Nx, int) and isinstance(Ny, int)
+    
+    assert isinstance(L, (tuple, list)) and len(L) == 2
+    Lx, Ly = L
+    assert isinstance(Lx, int) and isinstance(Ly, int)
+    assert Lx < Nx and Ly < Ny
+    assert Lx * Ly == l
+    
+    Kx, Ky = Nx - Lx + 1, Ny - Ly + 1
+    K = (Kx, Ky)
+    assert Kx * Ky == k
+  
+    # projection and devectorization
+    Pl = projection_matrix(Nx, Ny, L=L)
+    UU = devectorize(Pl.dot(U), Nx)
+    # projection and devectorization    
+    Pk = projection_matrix(Nx, Ny, L=K)
+    VV = devectorize(Pk.dot(V), Nx)
+    assert UU.shape == N
+    assert VV.shape == N
+    
+    from scipy.fftpack import fft2, ifft2
+    return ifft2(fft2(UU) * fft2(VV)).real
+    
 
 def compute_spectrum(X, fs):
     """
@@ -43,7 +279,7 @@ def compute_spectrum(X, fs):
 
 def hankelize(X):
     """
-    Hankelizes the matrix X.
+    Hankelizes a matrix X by performing diagonal averaging.
     
     Parameters
     ----------
@@ -74,7 +310,6 @@ def rename_columns(data_frame, group_labels=False):
     data_frame.rename(columns={i: str_fun(i) for i in data_frame.columns},
                       inplace=True)
 
-
 class SSA(object):
     
     __supported_types = (pd.Series, np.ndarray, list)
@@ -82,9 +317,9 @@ class SSA(object):
     __relative_ratio = 1e-2
     __power_threshold = 1e-3
     
-    def __init__(self, tseries, l, save_mem=True, svd_method="svd"):
+    def __init__(self, data, l, save_mem=True, svd_method="svd"):
         """
-        Decomposes the given time series with a singular-spectrum analysis. 
+        Decomposes the given data using singular-spectrum analysis. 
         Assumes the values of the time series are recorded at equal intervals.
         
         Parameters
@@ -100,20 +335,40 @@ class SSA(object):
         """
         
         # tedious type-checking for the initial time series
-        if not isinstance(tseries, self.__supported_types):
+        if not isinstance(data, self.__supported_types):
             raise TypeError("Unsupported time series object. Try Pandas Series, NumPy array or list.")
-        assert isinstance(l, int)
         assert isinstance(save_mem, bool)
         
-        # checks to save us from ourselves
-        self._n = len(tseries)
-        if not 2 <= l <= self._n / 2:
-            raise ValueError("The window length must be in the interval [2, N/2].")
+        self._ndim = data.ndim
         
-        self._l = l
-        self._orig_ts = pd.Series(tseries)
-        self._k = self._n - self._l + 1
-        
+        if self._ndim == 1:
+            self._n = data.size
+            
+            self._orig_ts = pd.Series(data)
+
+            # check window length input
+            assert isinstance(l, int) and l > 0
+            if not 2 <= l <= self._n / 2:
+                raise ValueError("The window length must be in the interval [2, N/2].")
+            self._l = l
+            
+            self._k = self._n - self._l + 1
+        else:
+            self._n = data.shape
+
+            self._orig_ts = pd.DataFrame(data)
+            
+            # check window length input
+            assert isinstance(l, (tuple, list)) and len(l) == data.ndim
+            for i in range(data.ndim):
+                if not 2 <= l[i] <= self._n[i] / 2:
+                    raise ValueError("The window length must be in the interval [2, N/2].")
+            self._l = l
+            
+            self._k = []
+            for i in range(data.ndim):
+                self._k.append(self._n[i] - self._l[i] + 1)
+
         # embedding step
         self._embed()
         
@@ -190,29 +445,42 @@ class SSA(object):
         assert hasattr(self, "_U")
         assert hasattr(self, "_VT")
         
-        # auxiliary variable (step 1)
-        lstar = min(self._k, self._l)
-        
-        # precompute weights (step 2)
-        weights = np.array(range(1, lstar + 1) + 
-                           [lstar] * (self._n - 2 * lstar + 1) +
-                           range(1, lstar)[::-1])
-        assert weights.size == self._n
+        if self._ndim == 1:
+            # (step 1 omitted)
+            # precompute weights (step 2)
+            if not hasattr(self, "_weights"):
+                self._compute_weights()
 
-        # allocate array
-        self._ts_components = np.zeros((self._n, self._d))
-        Uzeros = np.zeros(self._k - 1)
-        Vzeros = np.zeros(self._l - 1)
-        # loop over eigentriples
-        from scipy.fftpack import fft, ifft
-        for i in range(self._d):
-            # extend eigenvectors (step 3)
-            U = np.hstack((self._U[:,i], Uzeros))
-            assert U.size == self._n
-            V = np.hstack((self._VT[i,:], Vzeros))
-            assert V.size == self._n
-            # compute component (steps 4,5 and 6)
-            self._ts_components[:,i] = self._s[i] * ifft(fft(U) * fft(V)).real / weights
+            # allocate array
+            self._ts_components = np.zeros((self._n, self._d))
+            Uzeros = np.zeros(self._k - 1)
+            Vzeros = np.zeros(self._l - 1)
+            # loop over eigentriples
+            from scipy.fftpack import fft, ifft
+            for i in range(self._d):
+                # extend eigenvectors (step 3)
+                U = np.hstack((self._U[:,i], Uzeros))
+                assert U.size == self._n
+                V = np.hstack((self._VT[i,:], Vzeros))
+                assert V.size == self._n
+                # compute component (steps 4,5 and 6)
+                self._ts_components[:,i] = self._s[i] * ifft(fft(U) * fft(V)).real / self._weights
+        else:
+            L = np.prod(self._l)
+            K = np.prod(self._k)
+            
+            # precompute weights (step 1)
+            weights = diagsums(np.ones(L), np.ones(K), self._n, self._l)
+            
+            # compute shape (step 2) is omitted because it is only for shaped SSA
+            
+            # allocate array
+            self._ts_components = np.zeros(self._n + (self._d, ))
+            # loop over eigentriples
+            for i in range(self._d):
+                # compute component (steps 3 and 4)
+                self._ts_components[:,:,i] = self._s[i] * \
+                    diagsums(self._U[:,i], self._VT[i,:], self._n, self._l) / weights
 
     def _compute_group_spectra(self):
         """
@@ -222,6 +490,9 @@ class SSA(object):
         assert hasattr(self, "_ts_groups")
         assert hasattr(self, "_n_groups")
         assert hasattr(self, "_orig_ts")
+        
+        if self._ndim > 1:
+            raise NotImplementedError()
         
         # determine sampling time
         dt = np.unique(np.diff(self._orig_ts.index.values))
@@ -254,7 +525,11 @@ class SSA(object):
             self._compute_weights()
         
         # inline function for weighted inner product
-        w_inner = lambda i, j: self._weights.dot(self._ts_components[:,i]*self._ts_components[:,j])
+        if self._ndim == 1:
+            w_inner = lambda i, j: self._weights.dot(self._ts_components[...,i]*self._ts_components[...,j])
+        elif self._ndim == 2:
+            w_inner = lambda i, j: np.dot(self._weights[0],
+                                          (self._ts_components[...,i] * self._ts_components[...,j]).dot(self._weights[1]))
         
         # calculated inverted weighted norms, 1 / ||F_i||_w
         inv_wnorms = np.array([w_inner(i, i) for i in range(self._d)])
@@ -340,26 +615,50 @@ class SSA(object):
         """
         Computes the inner product weights by summing the diagonals of a matrix, which contains only ones.
         """
-        assert hasattr(self, "_k")
         assert hasattr(self, "_l")
-        tmp = np.ones((self._l, self._k), dtype=np.float)
-        self._weights = np.array([tmp.diagonal(i).sum() for i in range(-self._l + 1, self._k)])
+        assert hasattr(self, "_n")
+        assert hasattr(self, "_ndim")
+        
+        if self._ndim == 1:
+            self._weights = np.array([
+                min(i + 1, self._l, self._k, self._n - i)
+                for i in range(self._n)])
+        else:
+            assert len(self._k) == self._ndim
+            assert len(self._l) == self._ndim
+            assert len(self._n) == self._ndim
+            
+            self._weights = []
+            
+            for j in range(self._ndim):
+                self._weights.append(np.array([
+                    min(i + 1, self._l[j], self._k[j], self._n[j] - i) 
+                    for i in range(self._n[j]) ]))
 
     def _embed(self):
         """
         Creates the trajectory matrix from input data.
         """
         print "Computing trajectory matrix..."
-        assert hasattr(self, "_k")
-        assert hasattr(self, "_l")
         assert hasattr(self, "_orig_ts")
         assert hasattr(self._orig_ts, "values")
         ndim = self._orig_ts.values.ndim
         values = self._orig_ts.values
         
         if ndim == 1:
-            from scipy.linalg import hankel
-            self._X = hankel(values, np.zeros(self._l)).T[:,:self._k]
+            assert hasattr(self, "_k")
+            assert hasattr(self, "_l")
+            self._X = elementary_embedding(values, self._l)
+        elif ndim == 2:
+            assert hasattr(self, "_k")
+            assert hasattr(self, "_l")
+            assert isinstance(self._k, (tuple, list))
+            assert isinstance(self._l, (tuple, list))
+            assert len(self._k) == 2 and len(self._l) == 2
+            
+            tmpX = [elementary_embedding(values[:,i], self._l[0]) for i in range(0, self._n[1])]
+            self._X = block_hankel((self._l[1], self._k[1]), tmpX)
+            assert self._X.shape == (np.prod(self._l), np.prod(self._k))
 
         else:
             raise NotImplementedError()
@@ -436,25 +735,36 @@ class SSA(object):
         self._group_power = powers[sort_ind]
         
         # compute groups
-        self._ts_groups = np.zeros((self._n, self._n_groups))
+        if self._ndim == 1:
+            self._ts_groups = np.zeros((self._n, self._n_groups))
+        else:
+            self._ts_groups = np.zeros(self._n + (self._n_groups, ))
         for i, ind in enumerate(sort_ind):
             indices = clusters[ind][0]
             if isinstance(indices, (tuple, list, np.ndarray)):
                 if len(indices) > 1:
-                    self._ts_groups[:,i] = self._ts_components[:,indices].sum(axis=1)
+                    self._ts_groups[...,i] = self._ts_components[...,indices].sum(axis=-1)
                 else:
-                    self._ts_groups[:,i] = self._ts_components[:,indices]
+                    self._ts_groups[...,i] = self._ts_components[...,indices]
             else:
-                self._ts_groups[:,i] = self._ts_components[:,indices]
+                self._ts_groups[...,i] = self._ts_components[...,indices]
 
-    def get_components(self, n_components=None):
+    def get_components(self, n_components=None, pandas=False):
         """
-        Returns all the time series components in a single Pandas DataFrame object.
+        Returns all the time series components in a single object.
         
         Parameters
         ----------
         n_components : int
             Number of components to include. Default value is the maximum number of components.
+        
+        pandas : pandas
+            Boolean for returning pandas.DataFrame object.
+            
+        Returns
+        ----------
+        components : np.ndarray, pandas.DataFrame
+            Components as an array or data frame object.
         """
         assert isinstance(n_components, int) and n_components>=0
         assert hasattr(self, "_ts_components")
@@ -468,10 +778,15 @@ class SSA(object):
         # create list of columns
         cols = [i for i in range(n_components)]
         
-        return pd.DataFrame(self._ts_components[:, :n_components], columns=cols,
-                            index=self._orig_ts.index)
+        if pandas and self._ndim == 1:
+            return pd.DataFrame(self._ts_components[...,:n_components],
+                                columns=cols, index=self._orig_ts.index)
+        elif pandas:
+            return pd.DataFrame(self._ts_components[...,:n_components])
+        else:
+            return self._ts_components[...,:n_components]
     
-    def get_groups(self, max_index=None, min_index=0):
+    def get_groups(self, max_index=None, min_index=0, pandas=False):
         """
         Returns all the time series groups in a single Pandas DataFrame object.
         
@@ -479,10 +794,20 @@ class SSA(object):
         ----------
         max_index : int
             Maximum index of the group to be included. Default value is the number of groups.
+        
         min_index : int
             Minimum index of the group to be included. Default value is zero.
+        
+        pandas : bool
+            Boolean for returning pandas.DataFrame object.
+            
+        Returns
+        ----------
+        group_spectra : np.ndarray, pandas.DataFrame
+            Groups as an array or data frame object.
         """
         assert isinstance(min_index, int) and min_index >= 0
+        assert isinstance(pandas, bool)
         assert hasattr(self, "_ts_groups")
         assert hasattr(self, "_n_groups")
         
@@ -495,10 +820,15 @@ class SSA(object):
         # create list of columns - call them F0, F1, F2, ...
         cols = [i for i in range(min_index, max_index)]
         
-        return pd.DataFrame(self._ts_groups[:,min_index:max_index], columns=cols,
-                            index=self._orig_ts.index)
+        if pandas and self._ndim == 1:
+            return pd.DataFrame(self._ts_groups[...,min_index:max_index], columns=cols,
+                                index=self._orig_ts.index)
+        elif pandas:
+            return pd.DataFrame(self._ts_groups[...,min_index:max_index])
+        else:
+            return self._ts_groups[...,min_index:max_index]
     
-    def get_group_spectra(self, n_groups=None):
+    def get_group_spectra(self, n_groups=None, pandas=False):
         """
         Returns the spectra of the groups in a single Pandas DataFrame object.
         
@@ -506,8 +836,17 @@ class SSA(object):
         ----------
         n_groups : int
             Number of groups to include. Default value is the maximum number of groups.
+            
+        pandas : bool
+            Boolean for returning pandas.DataFrame object.
+
+        Returns
+        ----------
+        group_spectra : np.ndarray, pandas.DataFrame
+            Group spectra as an array or data frame object.
         """
         assert isinstance(n_groups, int) and n_groups >= 0
+        assert isinstance(pandas, bool)
         assert hasattr(self, "_ts_groups")
         assert hasattr(self, "_n_groups")
         
@@ -521,11 +860,16 @@ class SSA(object):
         
         # create list of columns
         cols = [i for i in range(n_groups)]
-            
-        return pd.DataFrame(self._group_spectra[:,:n_groups], columns=cols,
-                            index=self._freq)
+        
+        if pandas and self._ndim == 1:
+            return pd.DataFrame(self._group_spectra[...,:n_groups],
+                                columns=cols, index=self._freq)
+        elif pandas:
+            return pd.DataFrame(self._group_spectra[...,:n_groups])
+        else:
+            return self._group_spectra[...,:n_groups]
 
-    def reconstruct_from_groups(self, indices):
+    def reconstruct_from_groups(self, indices, pandas=False):
         """
         Reconstructs the time series from its groups, using the given indices. Returns a Pandas Series
         object with the reconstructed time series.
@@ -534,11 +878,20 @@ class SSA(object):
         ----------
         indices : int, tuple, list or slice
             Object representing the groups to sum.
+            
+        pandas : bool
+            Boolean for returning pandas.DataFrame object.
+            
+        Returns
+        ----------
+        reconstructed_data : np.ndarray, pandas.DataFrame
+            Reconstructed data as an array or data frame object.
         """
         assert isinstance(indices, (int, list, tuple, slice))
+        assert isinstance(pandas, bool)
         assert hasattr(self, "_ts_groups")
         assert hasattr(self, "_n_groups")
-
+        
         if isinstance(indices, int):
             assert indices < self._n_groups
             indices = [indices]
@@ -547,11 +900,16 @@ class SSA(object):
             assert min(indices) <= max(indices)
             assert min(indices) >= 0 and max(indices) < self._n_groups
 
-        ts_vals = self._ts_groups[:,indices].sum(axis=1)
+        ts_vals = self._ts_groups[...,indices].sum(axis=-1)
         
-        return pd.Series(ts_vals, index=self._orig_ts.index)
+        if pandas and self._ndim == 1:
+            return pd.DataFrame(ts_vals, index=self._orig_ts.index)
+        elif pandas:
+            return pd.DataFrame(ts_vals)
+        else:
+            return ts_vals
     
-    def reconstruct_elementary(self, indices):
+    def reconstruct_elementary(self, indices, pandas=False):
         """
         Reconstructs the time series from its elementary components, using the given indices. Returns a Pandas Series
         object with the reconstructed time series.
@@ -560,8 +918,17 @@ class SSA(object):
         ----------
         indices : int, tuple, list or slice
             Object representing the elementary components to sum.
+            
+        pandas : bool
+            Boolean for returning pandas.DataFrame object.
+
+        Returns
+        ----------
+        reconstructed_data : np.ndarray, pandas.DataFrame
+            Reconstructed data as an array or data frame object.
         """
         assert isinstance(indices, (int, list, tuple, slice))
+        assert isinstance(pandas, bool)
         assert hasattr(self, "_ts_components")
 
         if isinstance(indices, int):
@@ -571,10 +938,14 @@ class SSA(object):
         elif isinstance(indices, (list, tuple)):
             assert max(indices) < self._d
 
-        ts_vals = self._ts_components[:,indices].sum(axis=1)
+        ts_vals = self._ts_components[...,indices].sum(axis=-1)
         
-        return pd.Series(ts_vals, index=self._orig_ts.index)
-
+        if pandas and self._ndim == 1:
+            return pd.Series(ts_vals, index=self._orig_ts.index)
+        elif pandas:
+            return pd.Series(ts_vals)
+        else:
+            return ts_vals
     
     def plot_elementary_matrices(self, max_index=12, min_index=0):
         """
@@ -629,6 +1000,7 @@ class SSA(object):
         indices : tuple, list
             List of indices.
         """
+        # TODO: Does not work for a field!
         assert isinstance(min_index, int) and min_index >= 0
         assert isinstance(max_index, int) and min_index < max_index
         
@@ -667,6 +1039,7 @@ class SSA(object):
         indices : int, tuple, list or slice
             Object representing the groups to sum.
         """
+        # TODO: Does not work for a field!
         assert hasattr(self, "_ts_groups")
         assert hasattr(self, "_n_groups")
         
@@ -687,6 +1060,7 @@ class SSA(object):
         """
         Plots the most dominant period of all groups.
         """
+        # TODO: Does not work for a field!
         assert hasattr(self, "_ts_groups")
         assert hasattr(self, "_n_groups")
         
@@ -717,6 +1091,7 @@ class SSA(object):
         max_index : int
             Maximum group index to plot.
         """
+        # TODO: Does not work for a field!
         assert isinstance(max_index, int) and max_index>=0
         assert isinstance(xlim, (tuple, list))
         assert len(xlim) == 2
